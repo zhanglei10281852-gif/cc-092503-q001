@@ -191,21 +191,48 @@ class ApprovalRepository:
 
     def decide(self, request_id: int, approver_user_id: int, decision: str, comment: str, now: str) -> dict[str, Any]:
         request = self.get(request_id)
+        replay = self._replay_existing(request, approver_user_id, decision, comment)
+        if replay is not None:
+            return replay
         if request["state"] != "pending":
-            raise ConflictError("审批请求已经结束")
+            raise ConflictError(
+                "审批请求已经结束",
+                context={"request_id": request_id, "state": request["state"]},
+            )
         if request["requested_by"] == approver_user_id:
             raise ValidationError("申请人不能审批自己的请求")
-        self.connection.execute(
-            "INSERT INTO approval_decisions(request_id,approver_user_id,decision,comment,decided_at) VALUES(?,?,?,?,?)",
-            (request_id, approver_user_id, decision, comment, now),
-        )
+        try:
+            self.connection.execute(
+                "INSERT INTO approval_decisions(request_id,approver_user_id,decision,comment,decided_at) VALUES(?,?,?,?,?)",
+                (request_id, approver_user_id, decision, comment, now),
+            )
+        except sqlite3.IntegrityError:
+            # 唯一约束兜底：并发事务已写入同一审批人的决定，重新按重放或冲突判定
+            replay = self._replay_existing(self.get(request_id), approver_user_id, decision, comment)
+            if replay is None:
+                raise
+            return replay
         decisions = self.connection.execute("SELECT decision FROM approval_decisions WHERE request_id=?", (request_id,)).fetchall()
         state = "rejected" if any(row[0] == "reject" for row in decisions) else ("approved" if len(decisions) >= request["required_approvals"] else "pending")
         self.connection.execute(
             "UPDATE approval_requests SET state=?,version=version+1,updated_at=? WHERE id=?",
             (state, now, request_id),
         )
-        return self.get(request_id)
+        return {**self.get(request_id), "replayed": False}
+
+    def _replay_existing(self, request: dict[str, Any], approver_user_id: int, decision: str, comment: str) -> dict[str, Any] | None:
+        existing = self.connection.execute(
+            "SELECT * FROM approval_decisions WHERE request_id=? AND approver_user_id=?",
+            (request["id"], approver_user_id),
+        ).fetchone()
+        if existing is None:
+            return None
+        if existing["decision"] == decision and existing["comment"] == comment:
+            return {**request, "replayed": True}
+        raise ConflictError(
+            "该审批人已提交过不同的决定",
+            context={"request_id": request["id"], "state": request["state"], "existing_decision": existing["decision"]},
+        )
 
 
 class AnomalyRepository:

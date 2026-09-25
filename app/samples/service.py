@@ -258,6 +258,8 @@ class ApprovalService:
         principal.require("approvals.decide")
         before = self.approvals.get(request_id)
         result = self.approvals.decide(request_id, principal.user_id, data["decision"], data.get("comment", ""), to_storage(self.clock.now()))
+        if result["replayed"]:
+            return result
         self.audit.record(principal, "approval.decide", "approval_request", str(request_id), before=before, after=result)
         return result
 
