@@ -189,23 +189,48 @@ class ApprovalRepository:
         row["decisions"] = [dict(item) for item in self.connection.execute("SELECT * FROM approval_decisions WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
         return row
 
-    def decide(self, request_id: int, approver_user_id: int, decision: str, comment: str, now: str) -> dict[str, Any]:
+    def decide(self, request_id: int, approver_user_id: int, decision: str, comment: str, now: str) -> tuple[dict[str, Any], bool]:
         request = self.get(request_id)
+        existing = self._decision_of(request, approver_user_id)
+        if existing:
+            if existing["decision"] == decision and existing["comment"] == comment:
+                return request, True
+            raise ConflictError(
+                "同一审批人已提交过决定，不能重复提交或更改",
+                context={"request_id": request_id, "existing_decision": existing["decision"]},
+            )
         if request["state"] != "pending":
-            raise ConflictError("审批请求已经结束")
+            raise ConflictError("审批请求已经结束", context={"request_id": request_id, "state": request["state"]})
         if request["requested_by"] == approver_user_id:
             raise ValidationError("申请人不能审批自己的请求")
-        self.connection.execute(
-            "INSERT INTO approval_decisions(request_id,approver_user_id,decision,comment,decided_at) VALUES(?,?,?,?,?)",
-            (request_id, approver_user_id, decision, comment, now),
-        )
+        try:
+            self.connection.execute(
+                "INSERT INTO approval_decisions(request_id,approver_user_id,decision,comment,decided_at) VALUES(?,?,?,?,?)",
+                (request_id, approver_user_id, decision, comment, now),
+            )
+        except sqlite3.IntegrityError:
+            # 并发重试：另一事务已写入同一审批人的决定，按既有决定判定重复或冲突
+            existing = self._decision_of(self.get(request_id), approver_user_id)
+            if existing and existing["decision"] == decision and existing["comment"] == comment:
+                return self.get(request_id), True
+            raise ConflictError(
+                "同一审批人已提交过决定，不能重复提交或更改",
+                context={"request_id": request_id},
+            )
         decisions = self.connection.execute("SELECT decision FROM approval_decisions WHERE request_id=?", (request_id,)).fetchall()
         state = "rejected" if any(row[0] == "reject" for row in decisions) else ("approved" if len(decisions) >= request["required_approvals"] else "pending")
         self.connection.execute(
             "UPDATE approval_requests SET state=?,version=version+1,updated_at=? WHERE id=?",
             (state, now, request_id),
         )
-        return self.get(request_id)
+        return self.get(request_id), False
+
+    @staticmethod
+    def _decision_of(request: dict[str, Any], approver_user_id: int) -> dict[str, Any] | None:
+        for item in request["decisions"]:
+            if item["approver_user_id"] == approver_user_id:
+                return item
+        return None
 
 
 class AnomalyRepository:

@@ -257,9 +257,11 @@ class ApprovalService:
     def decide(self, principal: Principal, request_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("approvals.decide")
         before = self.approvals.get(request_id)
-        result = self.approvals.decide(request_id, principal.user_id, data["decision"], data.get("comment", ""), to_storage(self.clock.now()))
+        result, replayed = self.approvals.decide(request_id, principal.user_id, data["decision"], data.get("comment", ""), to_storage(self.clock.now()))
+        if replayed:
+            return {**result, "replayed": True}
         self.audit.record(principal, "approval.decide", "approval_request", str(request_id), before=before, after=result)
-        return result
+        return {**result, "replayed": False}
 
 
 class AnomalyService:
